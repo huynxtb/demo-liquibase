@@ -1,0 +1,29 @@
+# Single changelog shared by every environment (MySQL 8).
+#
+# In MySQL a schema IS a database, so each environment is its own database
+# (demoDev | demoUat | demoProd) selected purely by the JDBC URL. Nothing in
+# this file or in the SQL is environment specific.
+#
+# MySQL DDL is not transactional: a changeset that fails half-way leaves the
+# statements before the failure applied. Keep SQL files idempotent where MySQL
+# allows it (CREATE TABLE IF NOT EXISTS, DROP ... IF EXISTS, INSERT IGNORE,
+# CREATE OR REPLACE VIEW).
+databaseChangeLog:
+
+  - changeSet:
+      id: release-1.0.0
+      author: demo
+      changes:
+        - tagDatabase:
+            tag: release-1.0.0
+        - sqlFile:
+            path: changes/release-1.0.0/0001_create_customers.sql
+            dbms: mysql
+            endDelimiter: ";"
+            splitStatements: "true"
+      rollback:
+        - sqlFile:
+            path: changes/release-1.0.0/rollback.sql
+            dbms: mysql
+            endDelimiter: ";"
+            splitStatements: "true"
