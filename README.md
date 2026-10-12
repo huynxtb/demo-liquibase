@@ -198,7 +198,8 @@ Safeguards built into the pipeline:
 Restoring data from a backup artifact by hand:
 
 ```bash
-gunzip -c backup-prd-demoProd-20261012T021300Z.sql.gz   | mysql -h 194.233.83.104 -u root -p demoProd
+gunzip -c backup-prd-demoProd-20261012T021300Z.sql.gz \
+  | mysql -h 194.233.83.104 -u root -p demoProd
 ```
 
 ### Switching to a self-hosted runner
