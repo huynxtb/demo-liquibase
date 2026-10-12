@@ -69,6 +69,13 @@ jobs:
           if [ -n "$ROLLBACK_COUNT" ] && ! [ "$ROLLBACK_COUNT" -gt 0 ] 2>/dev/null; then
             echo "::error::rollback_count must be a positive integer, got '$ROLLBACK_COUNT'"; exit 1
           fi
+          # Production: rollback is an emergency path only. rollback_count is
+          # too easy to get wrong (a typo undoes the wrong number of releases),
+          # so prd accepts rollback_tag only. Prefer fixing forward with a new
+          # release, see README "Rollback on production".
+          if [ "${{ inputs.environment }}" = "prd" ] && [ -n "$ROLLBACK_COUNT" ]; then
+            echo "::error::rollback_count is not allowed on prd. Use rollback_tag (explicit release) or fix forward with a new release."; exit 1
+          fi
           echo "Environment ${{ inputs.environment }} -> ${LIQUIBASE_COMMAND_URL%%\?*}"
 
       - name: Checkout
@@ -106,6 +113,37 @@ jobs:
       - name: Apply update
         if: inputs.rollback_tag == '' && inputs.rollback_count == ''
         run: liquibase update
+
+      # ------------------------------------------------- backup before rollback
+      # Rollback SQL can drop tables and the data in them. Dump the whole
+      # database first and keep it as a run artifact so the data can be
+      # restored by hand if the rollback turns out to be a mistake.
+      - name: Backup database before rollback
+        if: inputs.rollback_tag != '' || inputs.rollback_count != ''
+        run: |
+          # jdbc:mysql://host:port/db?params -> host, port, db
+          rest="${LIQUIBASE_COMMAND_URL#jdbc:mysql://}"
+          hostport="${rest%%/*}"
+          db="${rest#*/}"; db="${db%%\?*}"
+          host="${hostport%%:*}"
+          port="${hostport#*:}"; [ "$port" = "$hostport" ] && port=3306
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          file="backup-${{ inputs.environment }}-${db}-${stamp}.sql.gz"
+          MYSQL_PWD="$LIQUIBASE_COMMAND_PASSWORD" mysqldump \
+            --host="$host" --port="$port" --user="$LIQUIBASE_COMMAND_USERNAME" \
+            --single-transaction --routines --triggers --events --set-gtid-purged=OFF \
+            "$db" | gzip > "$file"
+          ls -lh "$file"
+          echo "BACKUP_FILE=$file" >> "$GITHUB_ENV"
+
+      - name: Upload backup artifact
+        if: inputs.rollback_tag != '' || inputs.rollback_count != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_FILE }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 30
+          if-no-files-found: error
 
       # ------------------------------------------------------- rollback to tag
       - name: Preview SQL (rollback to ${{ inputs.rollback_tag }})
