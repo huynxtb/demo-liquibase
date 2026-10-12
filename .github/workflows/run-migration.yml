@@ -1,0 +1,108 @@
+name: Run migration (reusable)
+
+# Reusable job: runs Liquibase against ONE GitHub Environment (dev | uat | prd).
+# Called by migrate.yml. Connection details come from the GitHub Environment:
+#   vars.LIQUIBASE_COMMAND_URL        -> jdbc:mysql://<host>:3306/demoDev / demoUat / demoProd
+#   vars.LIQUIBASE_COMMAND_USERNAME   -> migration user
+#   secrets.LIQUIBASE_COMMAND_PASSWORD
+# In MySQL a schema is a database, so the environment is fully selected by the
+# URL. Nothing environment-specific is hardcoded in this file.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment to run against (dev | uat | prd)"
+        required: true
+        type: string
+      rollback_tag:
+        description: "Empty = update to the head of the changelog. Set a Liquibase tag to roll back to it instead."
+        required: false
+        type: string
+        default: ""
+      runner:
+        description: "Runner label. GitHub-hosted by default; the database must be reachable from it."
+        required: false
+        type: string
+        default: ubuntu-latest
+
+env:
+  LIQUIBASE_VERSION: "4.33.0"
+  JAVA_VERSION: "17"
+  MYSQL_CONNECTOR_VERSION: "9.7.0"
+
+jobs:
+  liquibase:
+    name: ${{ inputs.rollback_tag != '' && 'Rollback' || 'Update' }} ${{ inputs.environment }}
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    env:
+      LIQUIBASE_COMMAND_CHANGELOG_FILE: changelog.yaml
+      LIQUIBASE_COMMAND_URL: ${{ vars.LIQUIBASE_COMMAND_URL }}
+      LIQUIBASE_COMMAND_USERNAME: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
+      LIQUIBASE_COMMAND_PASSWORD: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
+      ROLLBACK_TAG: ${{ inputs.rollback_tag }}
+    steps:
+      - name: Check environment configuration
+        run: |
+          case "${{ inputs.environment }}" in
+            dev|uat|prd) ;;
+            *) echo "::error::Unknown environment '${{ inputs.environment }}' (expected dev, uat or prd)"; exit 1 ;;
+          esac
+          missing=0
+          for v in LIQUIBASE_COMMAND_URL LIQUIBASE_COMMAND_USERNAME LIQUIBASE_COMMAND_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is not configured on GitHub Environment '${{ inputs.environment }}' (vars.LIQUIBASE_COMMAND_* / secrets.LIQUIBASE_COMMAND_PASSWORD)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "Environment ${{ inputs.environment }} -> ${LIQUIBASE_COMMAND_URL%%\?*}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Liquibase
+        uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LIQUIBASE_VERSION }}
+          edition: oss
+
+      - name: Add MySQL JDBC driver
+        run: |
+          jar="$RUNNER_TEMP/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+          curl -fsSL -o "$jar" "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_CONNECTOR_VERSION}/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+          echo "LIQUIBASE_CLASSPATH=$jar" >> "$GITHUB_ENV"
+
+      - name: Validate changelog
+        run: liquibase validate
+
+      - name: Show pending changesets
+        run: liquibase status --verbose
+
+      # ---------------------------------------------------------------- update
+      - name: Preview SQL (update)
+        if: inputs.rollback_tag == ''
+        run: liquibase update-sql
+
+      - name: Apply update
+        if: inputs.rollback_tag == ''
+        run: liquibase update
+
+      # -------------------------------------------------------------- rollback
+      - name: Preview SQL (rollback to ${{ inputs.rollback_tag }})
+        if: inputs.rollback_tag != ''
+        run: liquibase rollback-sql --tag="${ROLLBACK_TAG}"
+
+      - name: Apply rollback to ${{ inputs.rollback_tag }}
+        if: inputs.rollback_tag != ''
+        run: liquibase rollback --tag="${ROLLBACK_TAG}"
+
+      - name: Show history
+        run: liquibase history

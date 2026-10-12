@@ -1,0 +1,11 @@
+# Personal overrides with real credentials (never commit)
+liquibase.properties.local
+.env
+
+# Liquibase generated
+*.log
+
+# Infra state and OS noise
+*.tfstate
+*.tfstate.*
+.DS_Store
