@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: ""
+      rollback_count:
+        description: "Roll back the N most recent changesets (no tag needed). Mutually exclusive with rollback_tag."
+        required: false
+        type: string
+        default: ""
       runner:
         description: "Runner label. GitHub-hosted by default; the database must be reachable from it."
         required: false
@@ -33,7 +38,7 @@ env:
 
 jobs:
   liquibase:
-    name: ${{ inputs.rollback_tag != '' && 'Rollback' || 'Update' }} ${{ inputs.environment }}
+    name: ${{ (inputs.rollback_tag != '' || inputs.rollback_count != '') && 'Rollback' || 'Update' }} ${{ inputs.environment }}
     runs-on: ${{ inputs.runner }}
     environment: ${{ inputs.environment }}
     env:
@@ -42,6 +47,7 @@ jobs:
       LIQUIBASE_COMMAND_USERNAME: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
       LIQUIBASE_COMMAND_PASSWORD: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
       ROLLBACK_TAG: ${{ inputs.rollback_tag }}
+      ROLLBACK_COUNT: ${{ inputs.rollback_count }}
     steps:
       - name: Check environment configuration
         run: |
@@ -57,6 +63,19 @@ jobs:
             fi
           done
           [ "$missing" -eq 0 ]
+          if [ -n "$ROLLBACK_TAG" ] && [ -n "$ROLLBACK_COUNT" ]; then
+            echo "::error::Set either rollback_tag or rollback_count, not both"; exit 1
+          fi
+          if [ -n "$ROLLBACK_COUNT" ] && ! [ "$ROLLBACK_COUNT" -gt 0 ] 2>/dev/null; then
+            echo "::error::rollback_count must be a positive integer, got '$ROLLBACK_COUNT'"; exit 1
+          fi
+          # Production: rollback is an emergency path only. rollback_count is
+          # too easy to get wrong (a typo undoes the wrong number of releases),
+          # so prd accepts rollback_tag only. Prefer fixing forward with a new
+          # release, see README "Rollback on production".
+          if [ "${{ inputs.environment }}" = "prd" ] && [ -n "$ROLLBACK_COUNT" ]; then
+            echo "::error::rollback_count is not allowed on prd. Use rollback_tag (explicit release) or fix forward with a new release."; exit 1
+          fi
           echo "Environment ${{ inputs.environment }} -> ${LIQUIBASE_COMMAND_URL%%\?*}"
 
       - name: Checkout
@@ -88,14 +107,45 @@ jobs:
 
       # ---------------------------------------------------------------- update
       - name: Preview SQL (update)
-        if: inputs.rollback_tag == ''
+        if: inputs.rollback_tag == '' && inputs.rollback_count == ''
         run: liquibase update-sql
 
       - name: Apply update
-        if: inputs.rollback_tag == ''
+        if: inputs.rollback_tag == '' && inputs.rollback_count == ''
         run: liquibase update
 
-      # -------------------------------------------------------------- rollback
+      # ------------------------------------------------- backup before rollback
+      # Rollback SQL can drop tables and the data in them. Dump the whole
+      # database first and keep it as a run artifact so the data can be
+      # restored by hand if the rollback turns out to be a mistake.
+      - name: Backup database before rollback
+        if: inputs.rollback_tag != '' || inputs.rollback_count != ''
+        run: |
+          # jdbc:mysql://host:port/db?params -> host, port, db
+          rest="${LIQUIBASE_COMMAND_URL#jdbc:mysql://}"
+          hostport="${rest%%/*}"
+          db="${rest#*/}"; db="${db%%\?*}"
+          host="${hostport%%:*}"
+          port="${hostport#*:}"; [ "$port" = "$hostport" ] && port=3306
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          file="backup-${{ inputs.environment }}-${db}-${stamp}.sql.gz"
+          MYSQL_PWD="$LIQUIBASE_COMMAND_PASSWORD" mysqldump \
+            --host="$host" --port="$port" --user="$LIQUIBASE_COMMAND_USERNAME" \
+            --single-transaction --routines --triggers --events --set-gtid-purged=OFF \
+            "$db" | gzip > "$file"
+          ls -lh "$file"
+          echo "BACKUP_FILE=$file" >> "$GITHUB_ENV"
+
+      - name: Upload backup artifact
+        if: inputs.rollback_tag != '' || inputs.rollback_count != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_FILE }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 30
+          if-no-files-found: error
+
+      # ------------------------------------------------------- rollback to tag
       - name: Preview SQL (rollback to ${{ inputs.rollback_tag }})
         if: inputs.rollback_tag != ''
         run: liquibase rollback-sql --tag="${ROLLBACK_TAG}"
@@ -103,6 +153,15 @@ jobs:
       - name: Apply rollback to ${{ inputs.rollback_tag }}
         if: inputs.rollback_tag != ''
         run: liquibase rollback --tag="${ROLLBACK_TAG}"
+
+      # ---------------------------------------------------- rollback by count
+      - name: Preview SQL (rollback last ${{ inputs.rollback_count }} changesets)
+        if: inputs.rollback_count != ''
+        run: liquibase rollback-count-sql --count="${ROLLBACK_COUNT}"
+
+      - name: Apply rollback of last ${{ inputs.rollback_count }} changesets
+        if: inputs.rollback_count != ''
+        run: liquibase rollback-count --count="${ROLLBACK_COUNT}"
 
       - name: Show history
         run: liquibase history
