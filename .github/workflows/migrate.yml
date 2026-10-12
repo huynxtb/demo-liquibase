@@ -6,8 +6,10 @@ name: Migrate database
 #   main -> GitHub Environment "prd"  (schema prd)
 # Promotion is done by merging dev -> uat -> main.
 #
-# "Run workflow" on a branch re-runs the migration for that branch's environment;
-# fill in rollback_tag to roll that environment back to a Liquibase tag instead.
+# "Run workflow" on a branch re-runs the migration for that branch's environment.
+# Fill in rollback_tag to roll back to a Liquibase tag, or rollback_count to
+# undo the N most recent changesets (use this to undo the very first release,
+# which has no earlier tag to roll back to).
 
 on:
   push:
@@ -20,7 +22,12 @@ on:
   workflow_dispatch:
     inputs:
       rollback_tag:
-        description: "Leave empty to update. Set a Liquibase tag (e.g. release-1.0.1) to roll back to it."
+        description: "Leave empty to update. Set a Liquibase tag (e.g. release-1.0.0) to roll back to it."
+        required: false
+        type: string
+        default: ""
+      rollback_count:
+        description: "Leave empty to update. Set N to roll back the N most recent changesets (no tag needed)."
         required: false
         type: string
         default: ""
@@ -40,4 +47,5 @@ jobs:
       # main -> prd, any other branch -> same-named environment (dev, uat).
       environment: ${{ github.ref_name == 'main' && 'prd' || github.ref_name }}
       rollback_tag: ${{ inputs.rollback_tag || '' }}
+      rollback_count: ${{ inputs.rollback_count || '' }}
     secrets: inherit
