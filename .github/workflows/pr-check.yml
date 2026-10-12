@@ -1,0 +1,108 @@
+name: PR check
+
+# Runs on every pull request into an environment branch. Uses a throwaway
+# MySQL service container (GitHub-hosted runner, no access to real DBs) and
+# proves that the changelog validates, applies, rolls all the way back, and
+# applies again. This catches missing SQL files, broken SQL and rollbacks that
+# do not undo their change.
+
+on:
+  pull_request:
+    branches: [dev, uat, main]
+    paths:
+      - changelog.yaml
+      - "changes/**"
+      - .github/workflows/pr-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LIQUIBASE_VERSION: "4.33.0"
+  JAVA_VERSION: "17"
+  MYSQL_CONNECTOR_VERSION: "9.7.0"
+
+jobs:
+  migration-roundtrip:
+    name: Update → rollback → update
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: demo
+          MYSQL_USER: demo
+          MYSQL_PASSWORD: demo
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -udemo -pdemo"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LIQUIBASE_COMMAND_CHANGELOG_FILE: changelog.yaml
+      LIQUIBASE_COMMAND_URL: jdbc:mysql://127.0.0.1:3306/demo
+      LIQUIBASE_COMMAND_USERNAME: demo
+      LIQUIBASE_COMMAND_PASSWORD: demo
+      # mysql client defaults
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_TCP_PORT: "3306"
+      MYSQL_PWD: demo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Liquibase
+        uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LIQUIBASE_VERSION }}
+          edition: oss
+
+      - name: Add MySQL JDBC driver
+        run: |
+          jar="$RUNNER_TEMP/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+          curl -fsSL -o "$jar" "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_CONNECTOR_VERSION}/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+          echo "LIQUIBASE_CLASSPATH=$jar" >> "$GITHUB_ENV"
+
+      - name: Validate changelog
+        run: liquibase validate
+
+      - name: Tag empty database
+        run: liquibase tag baseline
+
+      - name: Update to head
+        run: liquibase update
+
+      - name: Show created objects
+        run: mysql -udemo demo -e "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'demo' ORDER BY 1;"
+
+      - name: Roll everything back
+        run: liquibase rollback --tag=baseline
+
+      - name: Verify rollback left no application objects
+        run: |
+          left=$(mysql -udemo demo -N -s -e "
+            SELECT IFNULL(GROUP_CONCAT(table_name), '')
+            FROM information_schema.tables
+            WHERE table_schema = 'demo'
+              AND UPPER(table_name) NOT IN ('DATABASECHANGELOG', 'DATABASECHANGELOGLOCK');")
+          if [ -n "$left" ]; then
+            echo "::error::rollback.sql files are incomplete, objects left behind: $left"
+            exit 1
+          fi
+          echo "Database is clean after rollback"
+
+      - name: Re-apply update
+        run: liquibase update
+
+      - name: Show history
+        run: liquibase history
